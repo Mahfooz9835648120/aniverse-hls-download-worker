@@ -2,3 +2,6 @@ name = "aniverse-hls-download"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
 workers_dev = true
+
+[vars]
+ANIVEXA_PROXY_URL = "https://anivexa-apii-proxy.alammahfooz9276.workers.dev"

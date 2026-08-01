@@ -25,3 +25,7 @@ The endpoint forwards byte ranges and supports optional upstream context through
 several safe Referer/Origin combinations.
 
 Only public HTTP(S) targets are accepted. Private-network addresses are blocked.
+
+If the origin rejects Cloudflare with `401` or `403`, the Worker retries through
+the configured Anivexa proxy. Override `ANIVEXA_PROXY_URL` in Cloudflare when
+that proxy endpoint changes.

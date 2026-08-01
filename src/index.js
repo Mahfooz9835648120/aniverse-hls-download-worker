@@ -7,9 +7,10 @@ const CORS = {
 
 const USER_AGENT =
   'Mozilla/5.0 (Linux; Android 13; Aniverse) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36';
+const DEFAULT_ANIVEXA_PROXY = 'https://anivexa-apii-proxy.alammahfooz9276.workers.dev';
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
     if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: 'Method not allowed' }, 405);
 
@@ -53,6 +54,7 @@ export default {
 
     let upstream;
     let lastError = 'Upstream fetch failed';
+    const failures = [];
     for (const attempt of attempts) {
       try {
         const response = await fetch(target.toString(), {
@@ -66,12 +68,41 @@ export default {
           break;
         }
         lastError = `Upstream returned HTTP ${response.status}`;
+        failures.push(`direct:${response.status}`);
         await response.body?.cancel();
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
+        failures.push(`direct:${lastError}`);
       }
     }
-    if (!upstream) return json({ error: lastError }, 502);
+
+    if (!upstream) {
+      const proxyBase = String(env?.ANIVEXA_PROXY_URL || DEFAULT_ANIVEXA_PROXY).replace(/\/$/, '');
+      if (new URL(proxyBase).hostname !== target.hostname) {
+        const fallback = new URL(`${proxyBase}/`);
+        fallback.searchParams.set('url', target.toString());
+        if (referer) fallback.searchParams.set('ref', referer);
+        fallback.searchParams.set('download', '1');
+        try {
+          const response = await fetch(fallback.toString(), {
+            method: request.method,
+            redirect: 'follow',
+            headers: request.headers.get('Range') ? { Range: request.headers.get('Range') } : {},
+            cf: { cacheTtl: 0, cacheEverything: false },
+          });
+          if (response.ok || response.status === 206) upstream = response;
+          else {
+            failures.push(`anivexa:${response.status}`);
+            lastError = `Anivexa proxy returned HTTP ${response.status}`;
+            await response.body?.cancel();
+          }
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error);
+          failures.push(`anivexa:${lastError}`);
+        }
+      }
+    }
+    if (!upstream) return json({ error: lastError, targetHost: target.hostname, attempts: failures }, 502);
 
     const headers = new Headers(upstream.headers);
     Object.entries(CORS).forEach(([key, value]) => headers.set(key, value));
