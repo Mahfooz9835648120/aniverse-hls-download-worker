@@ -19,6 +19,7 @@ export default {
       return json({
         ok: true,
         service: 'Aniverse HLS download proxy',
+        version: '1.1.0-anivexa-fallback',
         usage: '/proxy?url=https%3A%2F%2Fexample.com%2Fmaster.m3u8',
       });
     }
