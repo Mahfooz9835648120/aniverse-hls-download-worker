@@ -5,11 +5,7 @@ const CORS = {
   'Access-Control-Expose-Headers': 'Content-Length,Content-Range,Accept-Ranges,Content-Type',
 };
 
-const USER_AGENT =
-  'Mozilla/5.0 (Linux; Android 13; Aniverse) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36';
 const DEFAULT_ANIVEXA_PROXY = 'https://anivexa-apii-proxy.alammahfooz9276.workers.dev';
-const DEFAULT_RAILWAY_PROXY = 'https://server-backend-production-abaa.up.railway.app/proxy';
-const DEFAULT_VERCEL_RELAY = 'https://aniversee.vercel.app/api/anivexa-stream';
 
 export default {
   async fetch(request, env) {
@@ -21,7 +17,7 @@ export default {
       return json({
         ok: true,
         service: 'Aniverse HLS download proxy',
-        version: '1.2.0-provider-fallbacks',
+        version: '1.3.0-anivexa-only',
         usage: '/proxy?url=https%3A%2F%2Fexample.com%2Fmaster.m3u8',
       });
     }
@@ -42,66 +38,35 @@ export default {
       || request.headers.get('Referer')
       || incoming.searchParams.get('ref')
       || '';
-    const origin = request.headers.get('X-Aniverse-Origin')
-      || request.headers.get('Origin')
-      || getOrigin(referer);
-    const cookie = request.headers.get('X-Aniverse-Cookie') || request.headers.get('Cookie') || '';
-    const authorization = request.headers.get('X-Aniverse-Authorization') || request.headers.get('Authorization') || '';
-
-    const attempts = unique([
-      { referer, origin },
-      { referer: `${target.origin}/`, origin: target.origin },
-      { referer, origin: '' },
-      { referer: '', origin: '' },
-    ]);
+    const proxyBase = String(env?.ANIVEXA_PROXY_URL || DEFAULT_ANIVEXA_PROXY).replace(/\/$/, '');
+    const proxyHost = new URL(proxyBase).hostname;
+    const upstreamUrl = target.hostname === proxyHost
+      ? target
+      : makeAnivexaUrl(proxyBase, target, referer);
+    const upstreamHeaders = new Headers();
+    const range = request.headers.get('Range');
+    if (range) upstreamHeaders.set('Range', range);
 
     let upstream;
-    let lastError = 'Upstream fetch failed';
-    const failures = [];
-    for (const attempt of attempts) {
-      try {
-        const response = await fetch(target.toString(), {
-          method: request.method,
-          redirect: 'follow',
-          headers: makeUpstreamHeaders(request, attempt, cookie, authorization),
-          cf: { cacheTtl: 0, cacheEverything: false },
-        });
-        if (!shouldRetry(response.status)) {
-          upstream = response;
-          break;
-        }
-        lastError = `Upstream returned HTTP ${response.status}`;
-        failures.push(`direct:${response.status}`);
-        await response.body?.cancel();
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
-        failures.push(`direct:${lastError}`);
-      }
+    try {
+      upstream = await fetch(upstreamUrl.toString(), {
+        method: request.method,
+        redirect: 'follow',
+        headers: upstreamHeaders,
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+    } catch (error) {
+      return json({
+        error: error instanceof Error ? error.message : 'Anivexa proxy fetch failed',
+        targetHost: target.hostname,
+        route: 'anivexa',
+      }, 502);
     }
-
-    if (!upstream) {
-      for (const fallback of buildFallbacks(env, target, referer)) {
-        try {
-          const response = await fetch(fallback.url, {
-            method: request.method,
-            redirect: 'follow',
-            headers: request.headers.get('Range') ? { Range: request.headers.get('Range') } : {},
-            cf: { cacheTtl: 0, cacheEverything: false },
-          });
-          if (response.ok || response.status === 206) {
-            upstream = response;
-            break;
-          }
-          failures.push(`${fallback.name}:${response.status}`);
-          lastError = `${fallback.name} returned HTTP ${response.status}`;
-          await response.body?.cancel();
-        } catch (error) {
-          lastError = error instanceof Error ? error.message : String(error);
-          failures.push(`${fallback.name}:${lastError}`);
-        }
-      }
+    if (!upstream.ok && upstream.status !== 206) {
+      const status = upstream.status;
+      await upstream.body?.cancel();
+      return json({ error: `Anivexa proxy returned HTTP ${status}`, targetHost: target.hostname, route: 'anivexa' }, 502);
     }
-    if (!upstream) return json({ error: lastError, targetHost: target.hostname, attempts: failures }, 502);
 
     const headers = new Headers(upstream.headers);
     Object.entries(CORS).forEach(([key, value]) => headers.set(key, value));
@@ -119,86 +84,12 @@ export default {
   },
 };
 
-function shouldRetry(status) {
-  return status === 401 || status === 403 || status === 408 || status === 429 || status >= 500;
-}
-
-function buildFallbacks(env, target, referer) {
-  const definitions = [
-    {
-      name: 'anivexa',
-      base: String(env?.ANIVEXA_PROXY_URL || DEFAULT_ANIVEXA_PROXY),
-      make(base) {
-        const url = new URL(`${base.replace(/\/$/, '')}/`);
-        url.searchParams.set('url', target.toString());
-        if (referer) url.searchParams.set('ref', referer);
-        url.searchParams.set('download', '1');
-        return url;
-      },
-    },
-    {
-      name: 'railway',
-      base: String(env?.RAILWAY_PROXY_URL || DEFAULT_RAILWAY_PROXY),
-      make(base) {
-        const url = new URL(base);
-        url.searchParams.set('url', target.toString());
-        if (referer) url.searchParams.set('referer', referer);
-        return url;
-      },
-    },
-    {
-      name: 'vercel',
-      base: String(env?.VERCEL_RELAY_URL || DEFAULT_VERCEL_RELAY),
-      make(base) {
-        const url = new URL(base);
-        url.searchParams.set('url', target.toString());
-        if (referer) url.searchParams.set('referer', referer);
-        return url;
-      },
-    },
-  ];
-
-  return definitions.flatMap(item => {
-    try {
-      const url = item.make(item.base);
-      return url.hostname === target.hostname ? [] : [{ name: item.name, url: url.toString() }];
-    } catch {
-      return [];
-    }
-  });
-}
-
-function makeUpstreamHeaders(request, attempt, cookie, authorization) {
-  const headers = new Headers({
-    'User-Agent': USER_AGENT,
-    Accept: request.headers.get('Accept') || '*/*',
-    'Accept-Encoding': 'identity',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': attempt.origin ? 'cross-site' : 'none',
-  });
-  const range = request.headers.get('Range');
-  if (range) headers.set('Range', range);
-  if (attempt.referer) headers.set('Referer', attempt.referer);
-  if (attempt.origin) headers.set('Origin', attempt.origin);
-  if (cookie) headers.set('Cookie', cookie);
-  if (authorization) headers.set('Authorization', authorization);
-  return headers;
-}
-
-function unique(attempts) {
-  const seen = new Set();
-  return attempts.filter(item => {
-    const key = `${item.referer}|${item.origin}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function getOrigin(value) {
-  try { return value ? new URL(value).origin : ''; } catch { return ''; }
+function makeAnivexaUrl(proxyBase, target, referer) {
+  const url = new URL(`${proxyBase}/`);
+  url.searchParams.set('url', target.toString());
+  if (referer) url.searchParams.set('ref', referer);
+  url.searchParams.set('download', '1');
+  return url;
 }
 
 function isPrivateHost(hostname) {
