@@ -8,6 +8,8 @@ const CORS = {
 const USER_AGENT =
   'Mozilla/5.0 (Linux; Android 13; Aniverse) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36';
 const DEFAULT_ANIVEXA_PROXY = 'https://anivexa-apii-proxy.alammahfooz9276.workers.dev';
+const DEFAULT_RAILWAY_PROXY = 'https://server-backend-production-abaa.up.railway.app/proxy';
+const DEFAULT_VERCEL_RELAY = 'https://aniversee.vercel.app/api/anivexa-stream';
 
 export default {
   async fetch(request, env) {
@@ -19,7 +21,7 @@ export default {
       return json({
         ok: true,
         service: 'Aniverse HLS download proxy',
-        version: '1.1.0-anivexa-fallback',
+        version: '1.2.0-provider-fallbacks',
         usage: '/proxy?url=https%3A%2F%2Fexample.com%2Fmaster.m3u8',
       });
     }
@@ -64,7 +66,7 @@ export default {
           headers: makeUpstreamHeaders(request, attempt, cookie, authorization),
           cf: { cacheTtl: 0, cacheEverything: false },
         });
-        if (response.status !== 401 && response.status !== 403) {
+        if (!shouldRetry(response.status)) {
           upstream = response;
           break;
         }
@@ -78,28 +80,24 @@ export default {
     }
 
     if (!upstream) {
-      const proxyBase = String(env?.ANIVEXA_PROXY_URL || DEFAULT_ANIVEXA_PROXY).replace(/\/$/, '');
-      if (new URL(proxyBase).hostname !== target.hostname) {
-        const fallback = new URL(`${proxyBase}/`);
-        fallback.searchParams.set('url', target.toString());
-        if (referer) fallback.searchParams.set('ref', referer);
-        fallback.searchParams.set('download', '1');
+      for (const fallback of buildFallbacks(env, target, referer)) {
         try {
-          const response = await fetch(fallback.toString(), {
+          const response = await fetch(fallback.url, {
             method: request.method,
             redirect: 'follow',
             headers: request.headers.get('Range') ? { Range: request.headers.get('Range') } : {},
             cf: { cacheTtl: 0, cacheEverything: false },
           });
-          if (response.ok || response.status === 206) upstream = response;
-          else {
-            failures.push(`anivexa:${response.status}`);
-            lastError = `Anivexa proxy returned HTTP ${response.status}`;
-            await response.body?.cancel();
+          if (response.ok || response.status === 206) {
+            upstream = response;
+            break;
           }
+          failures.push(`${fallback.name}:${response.status}`);
+          lastError = `${fallback.name} returned HTTP ${response.status}`;
+          await response.body?.cancel();
         } catch (error) {
           lastError = error instanceof Error ? error.message : String(error);
-          failures.push(`anivexa:${lastError}`);
+          failures.push(`${fallback.name}:${lastError}`);
         }
       }
     }
@@ -120,6 +118,55 @@ export default {
     });
   },
 };
+
+function shouldRetry(status) {
+  return status === 401 || status === 403 || status === 408 || status === 429 || status >= 500;
+}
+
+function buildFallbacks(env, target, referer) {
+  const definitions = [
+    {
+      name: 'anivexa',
+      base: String(env?.ANIVEXA_PROXY_URL || DEFAULT_ANIVEXA_PROXY),
+      make(base) {
+        const url = new URL(`${base.replace(/\/$/, '')}/`);
+        url.searchParams.set('url', target.toString());
+        if (referer) url.searchParams.set('ref', referer);
+        url.searchParams.set('download', '1');
+        return url;
+      },
+    },
+    {
+      name: 'railway',
+      base: String(env?.RAILWAY_PROXY_URL || DEFAULT_RAILWAY_PROXY),
+      make(base) {
+        const url = new URL(base);
+        url.searchParams.set('url', target.toString());
+        if (referer) url.searchParams.set('referer', referer);
+        return url;
+      },
+    },
+    {
+      name: 'vercel',
+      base: String(env?.VERCEL_RELAY_URL || DEFAULT_VERCEL_RELAY),
+      make(base) {
+        const url = new URL(base);
+        url.searchParams.set('url', target.toString());
+        if (referer) url.searchParams.set('referer', referer);
+        return url;
+      },
+    },
+  ];
+
+  return definitions.flatMap(item => {
+    try {
+      const url = item.make(item.base);
+      return url.hostname === target.hostname ? [] : [{ name: item.name, url: url.toString() }];
+    } catch {
+      return [];
+    }
+  });
+}
 
 function makeUpstreamHeaders(request, attempt, cookie, authorization) {
   const headers = new Headers({
